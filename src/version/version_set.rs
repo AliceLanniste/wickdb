@@ -30,7 +30,7 @@ use crate::storage::{File, Storage};
 use crate::table_cache::TableCache;
 use crate::util::coding::decode_fixed_64;
 use crate::util::collection::HashSet;
-use crate::util::comparator::{BytewiseComparator, Comparator};
+use crate::util::comparator::Comparator;
 use crate::util::reporter::LogReporter;
 use crate::util::slice::Slice;
 use crate::version::version_edit::{FileDelta, FileMetaData, VersionEdit};
@@ -53,15 +53,15 @@ struct LevelState {
 }
 
 /// Summarizes the files added and deleted from a set of version edits.
-pub struct VersionBuilder {
+pub struct VersionBuilder<'a> {
     // file changes for every level
     levels: Vec<LevelState>,
-    base: Version,
+    base: &'a Version,
 }
 
-impl VersionBuilder {
-    pub fn new(base: Version) -> Self {
-        let max_levels = base.options.max_levels as usize;
+impl<'a> VersionBuilder<'a> {
+    pub fn new(max_levels: usize, base: &'a Version) -> Self {
+        // let max_levels = base.options.max_levels as usize;
         let mut levels = Vec::with_capacity(max_levels);
         for _ in 0..max_levels {
             levels.push(LevelState {
@@ -72,7 +72,7 @@ impl VersionBuilder {
         Self { levels, base }
     }
 
-    /// Add the given VersionEdit for later applying
+    /// Add the given `FileDelta` for later applying
     /// 'vset.compaction_pointers' will be updated
     /// same as `apply` in C++ implementation
     pub fn accumulate<S: Storage + Clone>(&mut self, delta: FileDelta, vset: &mut VersionSet<S>) {
@@ -113,15 +113,15 @@ impl VersionBuilder {
 
     /// Apply all the changes on the base Version and produce a new Version based on it
     /// same as `SaveTo` in C++ implementation
-    pub fn apply_to_new(&mut self) -> Version {
+    pub fn apply_to_new(self, icmp: &InternalKeyComparator) -> Version {
         // TODO: config this to the option
-        let icmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
         let mut v = Version::new(self.base.options.clone(), icmp.clone());
         for (level, (base_files, delta)) in self
             .base
             .files
-            .drain(..)
-            .zip(self.levels.drain(..))
+            .clone()
+            .into_iter()
+            .zip(self.levels)
             .enumerate()
         {
             for file in base_files {
@@ -206,27 +206,35 @@ unsafe impl<S: Storage + Clone> Send for VersionSet<S> {}
 
 impl<S: Storage + Clone + 'static> VersionSet<S> {
     pub fn new(db_name: &'static str, options: Arc<Options>, storage: S) -> Self {
-        let mut compaction_stats = vec![];
-        for _ in 0..options.max_levels {
+        let max_level = options.max_levels as usize;
+        let mut compaction_stats = Vec::with_capacity(max_level);
+        let mut compaction_pointer = Vec::with_capacity(max_level);
+        for _ in 0..max_level {
             compaction_stats.push(CompactionStats::new());
+            compaction_pointer.push(InternalKey::default());
         }
+        let icmp = InternalKeyComparator::new(options.comparator.clone());
+        // Create an empty version as the first
+        let first_v = Arc::new(Version::new(options.clone(), icmp.clone()));
+        let mut versions = VecDeque::new();
+        versions.push_front(first_v);
         Self {
-            snapshots: SnapshotList::new(),
+            snapshots: SnapshotList::default(),
             compaction_stats,
             pending_outputs: HashSet::default(),
             db_name,
             storage,
             record_writer: None,
-            options: options.clone(),
-            icmp: InternalKeyComparator::new(options.comparator.clone()),
+            options,
+            icmp,
             next_file_number: 0,
             last_sequence: 0,
             log_number: 0,
             prev_log_number: 0,
             manifest_file_number: 0,
             manifest_writer: None,
-            versions: VecDeque::new(),
-            compaction_pointer: vec![],
+            versions,
+            compaction_pointer,
         }
     }
     /// Returns the number of files in a certain level
@@ -293,9 +301,11 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
         self.last_sequence = new
     }
 
-    /// Get the current newest version
+    /// Get the current newest version.
     #[inline]
     pub fn current(&self) -> Arc<Version> {
+        // In `VersionSet::new()`, we always create a empty version as the first one so
+        // that the `unwrap()` here is safe
         self.versions.front().unwrap().clone()
     }
 
@@ -369,11 +379,11 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
         let mut record = vec![];
         edit.encode_to(&mut record);
 
-        let mut v = Version::new(self.options.clone(), self.icmp.clone());
-        let mut builder = VersionBuilder::new(v);
+        let this = self.current();
+        let mut builder = VersionBuilder::new(self.options.max_levels as usize, this.as_ref());
         let file_delta = edit.take_file_delta();
         builder.accumulate(file_delta, self);
-        v = builder.apply_to_new();
+        let mut v = builder.apply_to_new(&self.icmp);
         v.finalize();
 
         // cleanup all the old versions
@@ -524,9 +534,14 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
                 compaction
             } else if seek_compaction {
                 let level = current.file_to_compact_level.load(Ordering::Acquire);
-                let mut compaction = Compaction::new(self.options.clone(), level);
-                compaction.inputs.add_base(file_to_compact);
-                compaction
+                if level < self.options.max_levels as usize - 1 {
+                    let mut compaction = Compaction::new(self.options.clone(), level);
+                    compaction.inputs.add_base(file_to_compact);
+                    compaction
+                } else {
+                    // We've run out of the levels
+                    return None;
+                }
             } else {
                 return None;
             }
@@ -561,7 +576,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
         let now = SystemTime::now();
         let mut meta = FileMetaData::default();
         meta.number = self.inc_next_file_number();
-        info!("Level-0 table #{} : started", meta.number);
+        info!("Level-0 table #{} : start building", meta.number);
         let build_result = build_table(
             self.options.clone(),
             &self.storage,
@@ -571,7 +586,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
             &mut meta,
         );
         info!(
-            "Level-0 table #{} : {} bytes [{:?}]",
+            "Level-0 table #{} : try to write {} bytes [{:?}]",
             meta.number, meta.file_size, &build_result
         );
         let mut level = 0;
@@ -612,19 +627,20 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
     }
 
     /// Create new table builder and physical file for current output in Compaction
-    pub fn open_compaction_output_file(&mut self, compact: &mut Compaction<S::F>) -> Result<()> {
-        assert!(compact.builder.is_none());
+    pub fn open_compaction_output_file(&mut self, c: &mut Compaction<S::F>) -> Result<()> {
+        assert!(c.builder.is_none());
         let file_number = self.inc_next_file_number();
         self.pending_outputs.insert(file_number);
         let mut output = FileMetaData::default();
         output.number = file_number;
         let file_name = generate_filename(self.db_name, FileType::Table, file_number);
         let file = self.storage.create(file_name.as_str())?;
-        compact.builder = Some(TableBuilder::new(
+        c.builder = Some(TableBuilder::new(
             file,
             self.icmp.clone(),
             self.options.clone(),
         ));
+        c.outputs.push(output);
         Ok(())
     }
 
@@ -653,9 +669,9 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
                 )));
             }
         };
-        let file_length = current_manifest.len();
-        let mut builder =
-            VersionBuilder::new(Version::new(self.options.clone(), self.icmp.clone()));
+        let file_length = current_manifest.len()?;
+        let base = Version::new(self.options.clone(), self.icmp.clone());
+        let mut builder = VersionBuilder::new(self.options.max_levels as usize, &base);
         let reporter = LogReporter::new();
         let mut reader = Reader::new(current_manifest, Some(Box::new(reporter.clone())), true, 0);
         let mut buf = vec![];
@@ -674,6 +690,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
             }
             let mut edit = VersionEdit::new(self.options.max_levels);
             edit.decoded_from(&buf)?;
+            debug!("Decoded manifest record: {:?}", &edit);
             if let Some(ref cmp_name) = edit.comparator_name {
                 if cmp_name.as_str() != self.icmp.user_comparator.name() {
                     return Err(Error::InvalidArgument(
@@ -701,6 +718,10 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
             }
         }
 
+        if let Err(e) = reporter.result() {
+            return Err(e);
+        }
+
         if !has_next_file_number {
             return Err(Error::Corruption(
                 "no meta-nextfile entry in manifest".to_owned(),
@@ -724,7 +745,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
         self.mark_file_number_used(prev_log_number);
         self.mark_file_number_used(log_number);
 
-        let mut new_v = builder.apply_to_new();
+        let mut new_v = builder.apply_to_new(&self.icmp);
         new_v.finalize();
         self.versions.push_front(Arc::new(new_v));
         self.manifest_file_number = next_file_number;
@@ -787,8 +808,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
     fn setup_other_inputs(&mut self, c: Compaction<S::F>) -> Compaction<S::F> {
         let mut c = self.add_boundary_inputs(c);
         let current = &self.current();
-        // TODO: remove this clone
-        let inputs = std::mem::replace(&mut c.inputs, CompactionInputs::default());
+        let inputs = std::mem::take(&mut c.inputs);
         let not_expand = inputs.base;
         // Calculate the key range in current level after `add_boundary_inputs`
         let (smallest, largest) = base_range(&not_expand, c.level, &self.icmp);
@@ -948,7 +968,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
     }
 
     // See if we can reuse the existing MANIFEST file
-    fn should_reuse_manifest(&mut self, manifest_file: &str, file_size: Result<u64>) -> bool {
+    fn should_reuse_manifest(&mut self, manifest_file: &str, file_size: u64) -> bool {
         if !self.options.reuse_logs {
             return false;
         }
@@ -956,27 +976,22 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
             if file_type != FileType::Manifest {
                 return false;
             };
-            match file_size {
-                Ok(len) => {
-                    // Make new compacted MANIFEST if old one is too big
-                    if len > self.options.max_file_size {
-                        return false;
-                    }
-                    match self.storage.open(manifest_file) {
-                        Ok(f) => {
-                            info!("Reusing MANIFEST {}", manifest_file);
-                            let writer = Writer::new(f);
-                            self.manifest_writer = Some(writer);
-                            self.manifest_file_number = file_number;
-                            true
-                        }
-                        Err(e) => {
-                            error!("Reuse MANIFEST {:?}", e);
-                            false
-                        }
-                    }
+            // Make new compacted MANIFEST if old one is too big
+            if file_size > self.options.max_file_size {
+                return false;
+            }
+            match self.storage.open(manifest_file) {
+                Ok(f) => {
+                    info!("Reusing MANIFEST {}", manifest_file);
+                    let writer = Writer::new(f);
+                    self.manifest_writer = Some(writer);
+                    self.manifest_file_number = file_number;
+                    true
                 }
-                Err(_) => false,
+                Err(e) => {
+                    error!("Reuse MANIFEST {:?}", e);
+                    false
+                }
             }
         } else {
             false
@@ -984,6 +999,7 @@ impl<S: Storage + Clone + 'static> VersionSet<S> {
     }
 }
 
+///
 pub struct FileIterFactory<S: Storage + Clone> {
     options: ReadOptions,
     table_cache: TableCache<S>,
@@ -1007,6 +1023,7 @@ impl<S: Storage + Clone> FileIterFactory<S> {
 impl<S: Storage + Clone> DerivedIterFactory for FileIterFactory<S> {
     type Iter = TableIterator<InternalKeyComparator, S::F>;
 
+    // The value is a bytes with fixed encoded file number and fixed encoded file size
     fn derive(&self, value: &[u8]) -> Result<Self::Iter> {
         if value.len() != FILE_META_LENGTH {
             Err(Error::Corruption(

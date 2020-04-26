@@ -28,7 +28,10 @@ use std::sync::Arc;
 /// The max key sequence number. The value is 2^56 - 1 because the seq number
 /// only takes 56 bits when is serialized to `InternalKey`
 pub const MAX_KEY_SEQUENCE: u64 = (1u64 << 56) - 1;
-const INTERNAL_KEY_TAIL: usize = 8; // 7bytes sequence number + 1byte type number
+
+/// The tail bytes length of an internal key
+/// 7bytes sequence number + 1byte type number
+pub const INTERNAL_KEY_TAIL: usize = 8;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ValueType {
@@ -133,7 +136,7 @@ impl<'a> Debug for ParsedInternalKey<'a> {
 /// ```
 ///
 // TODO: use &'a [u8] instead of Vec<u8>
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct InternalKey {
     data: Vec<u8>,
 }
@@ -199,12 +202,6 @@ impl Debug for InternalKey {
             let s = unsafe { ::std::str::from_utf8_unchecked(self.data.as_slice()) };
             write!(f, "(bad){}", s)
         }
-    }
-}
-
-impl Default for InternalKey {
-    fn default() -> Self {
-        InternalKey { data: vec![] }
     }
 }
 

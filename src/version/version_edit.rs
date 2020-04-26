@@ -109,7 +109,7 @@ pub struct VersionEdit {
     pub file_delta: FileDelta,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct FileDelta {
     // (level, InternalKey)
     pub compaction_pointers: Vec<(usize, InternalKey)>,
@@ -151,7 +151,7 @@ impl VersionEdit {
 
     #[inline]
     pub fn take_file_delta(&mut self) -> FileDelta {
-        mem::replace(&mut self.file_delta, FileDelta::default())
+        mem::take(&mut self.file_delta)
     }
 
     /// Add the specified file at the specified number
@@ -397,15 +397,15 @@ impl Debug for VersionEdit {
             write!(f, "\n  LastSeq: {}", last_seq)?;
         }
         for (level, key) in self.file_delta.compaction_pointers.iter() {
-            write!(f, "\n  CompactPointer: {} {:?}", level, key)?;
+            write!(f, "\n  CompactPointer: @{} {:?}", level, key)?;
         }
         for (level, file_num) in self.file_delta.deleted_files.iter() {
-            write!(f, "\n  DeleteFile: {} {}", level, file_num)?;
+            write!(f, "\n  DeleteFile: @{} #{}", level, file_num)?;
         }
         for (level, meta) in self.file_delta.new_files.iter() {
             write!(
                 f,
-                "\n  AddFile: {} {} {} {:?}..{:?}",
+                "\n  AddFile: @{} #{} {}bytes range: [{:?}, {:?}]",
                 level, meta.number, meta.file_size, meta.smallest, meta.largest
             )?;
         }
