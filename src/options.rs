@@ -207,7 +207,7 @@ impl Options {
     /// Initialize Options by limiting ranges of some flags, applying customized Logger and etc.
     pub(crate) fn initialize<O: File + 'static, S:Storage<F = O>+Clone+'static>(
         &mut self,
-        db_name: String,
+        db_name: &'static str,
         storage:  &S,
     ) {
         self.max_open_files =
@@ -215,7 +215,7 @@ impl Options {
         self.write_buffer_size = Self::clip_range(self.write_buffer_size, 64 << 10, 1 << 30);
         self.max_file_size = Self::clip_range(self.max_file_size, 1 << 20, 1 << 30);
         self.block_size = Self::clip_range(self.block_size, 1 << 10, 4 << 20);
-        self.apply_logger(storage, &db_name);
+        self.apply_logger(storage, db_name);
         if self.block_cache.is_none() {
             self.block_cache = Some(Arc::new(LRUCache::new(8 << 20, None)))
         }
@@ -225,9 +225,9 @@ impl Options {
     }
 
     #[allow(unused_must_use)]
-    fn apply_logger<S: 'static+Storage+Clone>(&mut self, storage: &S, db_path: &str) {
+    fn apply_logger<S: 'static+Storage+Clone>(&mut self, storage: &S, db_path: &'static str) {
         let user_logger = std::mem::replace(&mut self.logger, None);
-        let logger = Logger::new(user_logger, self.logger_level, storage.clone(), db_path.to_string());
+        let logger = Logger::new(user_logger, self.logger_level, storage.clone(), db_path);
         let static_logger: &'static dyn Log = Box::leak(Box::new(logger));
         log::set_logger(static_logger);
         log::set_max_level(self.logger_level);
